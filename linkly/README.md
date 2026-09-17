@@ -111,8 +111,9 @@ The connector creates five tables (refer to `schema()`):
 Relationships: `link.workspace_id`, `domain.workspace_id` and `click_daily.workspace_id` reference `workspace.id`. `conversion.link_id` references `link.id` and is null when the conversion could not be attributed. `conversion.amount_cents` is an integer in minor units of `conversion.currency`.
 
 ## Additional files
-- `tests/mock_linkly_api.py` – A standard-library HTTP server that imitates the five Linkly endpoints with the response shapes from the OpenAPI spec, including one simulated HTTP 429 and bearer-token checking, so `fivetran debug` can run without a real API key. Start it with `python tests/mock_linkly_api.py 5055`. Restart it with `--drop-domain` and sync again to exercise domain deletion, or pass `--conversion-count <n>` to change how many conversions exist.
-- `tests/mock-configuration.json` – Configuration that points the connector at the mock server. Run `fivetran debug --configuration tests/mock-configuration.json` from the connector directory while the mock is running.
+The connector uses the following additional files:
+- **`tests/mock_linkly_api.py`** – A standard-library HTTP server that imitates the five Linkly endpoints with the response shapes from the OpenAPI spec, including one simulated HTTP 429 and bearer-token checking, so `fivetran debug` can run without a real API key. Start it with `python tests/mock_linkly_api.py 5055`. Restart it with `--drop-domain` and sync again to exercise domain deletion, or pass `--conversion-count <n>` to change how many conversions exist.
+- **`tests/mock-configuration.json`** – Configuration that points the connector at the mock server. Run `fivetran debug --configuration tests/mock-configuration.json` from the connector directory while the mock is running.
 
 ## Additional considerations
 The examples provided are intended to help you effectively use Fivetran's Connector SDK. While we've tested the code, Fivetran cannot be held responsible for any unexpected or negative consequences that may arise from using these examples. For inquiries, please reach out to our Support team.

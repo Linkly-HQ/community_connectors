@@ -130,11 +130,21 @@ class MockLinklyHandler(BaseHTTPRequestHandler):
     """Routes GET requests to the mock implementations of the Linkly endpoints."""
 
     def log_message(self, format, *args):
-        """Write request lines to stderr with a prefix instead of the default noisy format."""
+        """Write request lines to stderr with a prefix instead of the default noisy format.
+
+        Args:
+            format: printf-style format string supplied by BaseHTTPRequestHandler.
+            *args: values interpolated into the format string.
+        """
         sys.stderr.write("mock: " + (format % args) + "\n")
 
     def send_json(self, status, payload):
-        """Send a JSON response with the given HTTP status."""
+        """Send a JSON response with the given HTTP status.
+
+        Args:
+            status: HTTP status code to send.
+            payload: JSON-serialisable response body.
+        """
         body = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -161,7 +171,13 @@ class MockLinklyHandler(BaseHTTPRequestHandler):
         return self.send_json(404, {"error": "Not found", "code": "not_found"})
 
     def handle_workspace_resource(self, workspace_id, resource, query):
-        """Serve the list_links, domains and clicks endpoints for one workspace."""
+        """Serve the list_links, domains and clicks endpoints for one workspace.
+
+        Args:
+            workspace_id: Workspace id taken from the request path.
+            resource: Resource name taken from the request path (list_links, domains or clicks).
+            query: Parsed query-string parameters, first value per key.
+        """
         if workspace_id not in {workspace["id"] for workspace in WORKSPACES}:
             return self.send_json(404, {"error": "Not found", "code": "not_found"})
         if resource == "list_links":
@@ -178,7 +194,12 @@ class MockLinklyHandler(BaseHTTPRequestHandler):
         return self.send_json(404, {"error": "Not found", "code": "not_found"})
 
     def send_links(self, workspace_id, query):
-        """Serve one page of active or trashed links, with a single simulated rate limit."""
+        """Serve one page of active or trashed links, with a single simulated rate limit.
+
+        Args:
+            workspace_id: Workspace whose links are being listed.
+            query: Parsed query-string parameters (page, page_size, deleted).
+        """
         if RATE_LIMIT_ONCE["is_armed"]:
             RATE_LIMIT_ONCE["is_armed"] = False
             return self.send_json(
@@ -215,7 +236,12 @@ class MockLinklyHandler(BaseHTTPRequestHandler):
         )
 
     def send_clicks(self, workspace_id, query):
-        """Serve a deterministic daily click series for the requested date range."""
+        """Serve a deterministic daily click series for the requested date range.
+
+        Args:
+            workspace_id: Workspace whose clicks are being reported.
+            query: Parsed query-string parameters (start, end, bots).
+        """
         start = date.fromisoformat(query["start"][:10])
         end = date.fromisoformat(query["end"][:10])
         is_human_only = query.get("bots") == "false"
