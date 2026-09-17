@@ -15,6 +15,12 @@ import time
 # For computing the date windows used by the click history sync
 from datetime import date, datetime, timedelta, timezone
 
+# For parsing the HTTP-date form of the Retry-After header
+from email.utils import parsedate_to_datetime
+
+# For validating the optional base_url configuration value
+from urllib.parse import urlparse
+
 # Import required classes from fivetran_connector_sdk
 from fivetran_connector_sdk import Connector
 
@@ -58,6 +64,7 @@ __CONVERSION_TABLE = "conversion"
 __STATE_LINK_RESUME_PAGE = "link_resume_page"  # {"<workspace_id>:<active|deleted>": page}
 __STATE_CLICK_CURSOR = "click_cursor_by_workspace"  # {"<workspace_id>": "YYYY-MM-DD"}
 __STATE_CONVERSION_CURSOR = "conversion_cursor"  # Highest conversion id (ULID) delivered
+__STATE_DOMAIN_NAMES = "domain_names_by_workspace"  # {"<workspace_id>": ["<domain name>", ...]}
 
 # The list_links endpoint returns active links by default and trashed links with deleted=true.
 __LINK_MODES = ((False, "active"), (True, "deleted"))
@@ -81,18 +88,18 @@ def validate_configuration(configuration: dict):
         )
 
     start_date = configuration.get("start_date")
-    if start_date:
-        try:
-            parsed_start_date = date.fromisoformat(start_date)
-        except ValueError:
-            raise ValueError(
-                f"Configuration value 'start_date' must be YYYY-MM-DD, got {start_date!r}"
-            )
+    if start_date not in (None, ""):
+        parsed_start_date = parse_start_date(start_date)
         if parsed_start_date > datetime.now(timezone.utc).date():
             raise ValueError("Configuration value 'start_date' must not be in the future")
 
     workspace_ids = configuration.get("workspace_ids")
-    if workspace_ids:
+    if workspace_ids not in (None, ""):
+        if not isinstance(workspace_ids, str):
+            raise ValueError(
+                "Configuration value 'workspace_ids' must be a string containing a "
+                f"comma-separated list of numeric workspace ids, got {workspace_ids!r}"
+            )
         for workspace_id in workspace_ids.split(","):
             if not workspace_id.strip().isdigit():
                 raise ValueError(
@@ -101,10 +108,49 @@ def validate_configuration(configuration: dict):
                 )
 
     base_url = configuration.get("base_url")
-    if base_url and not base_url.startswith(("https://", "http://")):
+    if base_url not in (None, "") and not is_http_url(base_url):
         raise ValueError(
-            f"Configuration value 'base_url' must be an http(s) URL, got {base_url!r}"
+            "Configuration value 'base_url' must be an http(s) URL with a host, for example "
+            f"https://api.linklyhq.com/api/v1, got {base_url!r}"
         )
+
+
+def parse_start_date(start_date):
+    """
+    Parse the start_date configuration value, accepting only the canonical YYYY-MM-DD form.
+    date.fromisoformat() also accepts other ISO 8601 forms such as 20260601, so the parsed date
+    is formatted again and compared with the input.
+    Args:
+        start_date: The raw configuration value.
+    Returns:
+        The parsed date.
+    Raises:
+        ValueError: if the value is not a string in YYYY-MM-DD format.
+    """
+    error_message = f"Configuration value 'start_date' must be YYYY-MM-DD, got {start_date!r}"
+    if not isinstance(start_date, str):
+        raise ValueError(error_message)
+    try:
+        parsed_start_date = date.fromisoformat(start_date)
+    except ValueError:
+        raise ValueError(error_message)
+    if parsed_start_date.isoformat() != start_date:
+        raise ValueError(error_message)
+    return parsed_start_date
+
+
+def is_http_url(value):
+    """
+    Check that a configuration value is an absolute http or https URL with a network location.
+    Args:
+        value: The raw configuration value.
+    Returns:
+        True if the value is a string with an http or https scheme and a host, otherwise False.
+    """
+    if not isinstance(value, str):
+        return False
+    parsed_url = urlparse(value.strip())
+    return parsed_url.scheme in ("http", "https") and bool(parsed_url.netloc)
 
 
 def schema(configuration: dict):
@@ -317,15 +363,42 @@ def wait_before_retry(attempt: int, reason: str, retry_after_header: str = None)
     Args:
         attempt: The 1-based attempt number that just failed.
         reason: Description of the failure for the log.
-        retry_after_header: Optional Retry-After header value in seconds.
+        retry_after_header: Optional Retry-After header value, in seconds or as an HTTP-date.
     """
     if attempt >= __MAX_RETRIES:
         return
     delay_sec = min(__BACKOFF_BASE_SEC * (2 ** (attempt - 1)), __BACKOFF_MAX_SEC)
-    if retry_after_header and retry_after_header.isdigit():
-        delay_sec = min(int(retry_after_header), __BACKOFF_MAX_SEC)
+    retry_after_sec = parse_retry_after(retry_after_header)
+    if retry_after_sec is not None:
+        delay_sec = min(retry_after_sec, __BACKOFF_MAX_SEC)
     log.warning(f"{reason}; retrying in {delay_sec}s (attempt {attempt}/{__MAX_RETRIES})")
     time.sleep(delay_sec)
+
+
+def parse_retry_after(retry_after_header):
+    """
+    Convert a Retry-After header value into a delay in seconds.
+    RFC 9110 allows either a number of seconds or an HTTP-date; both forms are supported.
+    Args:
+        retry_after_header: The raw header value, or None when the header is absent.
+    Returns:
+        The delay in whole seconds (never negative), or None if the header is absent or invalid.
+    """
+    if not retry_after_header:
+        return None
+    value = retry_after_header.strip()
+    if value.isdigit():
+        return int(value)
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if retry_at is None:
+        return None
+    if retry_at.tzinfo is None:
+        # HTTP-dates are always GMT; parsedate_to_datetime returns a naive value for "-0000".
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
 
 
 def sync_workspaces(session: requests.Session, base_url: str, workspace_filter, state: dict):
@@ -470,24 +543,34 @@ def build_link_row(link: dict, workspace_id: int, is_deleted: bool):
 def sync_domains(session: requests.Session, base_url: str, workspace_id: int, state: dict):
     """
     Re-import the custom domains configured for one workspace. The endpoint is not paginated.
+    The domain names delivered for each workspace are kept in state, so a domain that was
+    removed in Linkly since the previous sync is deleted from the destination.
     Args:
         session: The authenticated HTTP session.
         base_url: The API base URL.
         workspace_id: The workspace whose domains are synced.
-        state: The connector state, checkpointed after the table is written.
+        state: The connector state; domain_names_by_workspace holds the names last delivered.
     """
     body = get_json(session, base_url, f"workspace/{workspace_id}/domains")
-    domains = body.get("domains") or []
-    for domain in domains:
-        if not domain.get("name"):
-            continue
+    domain_names = {domain["name"] for domain in body.get("domains") or [] if domain.get("name")}
+    for domain_name in sorted(domain_names):
         # The 'upsert' operation is used to insert or update data in the destination table.
         # The first argument is the name of the destination table.
         # The second argument is a dictionary containing the record to be upserted.
-        op.upsert(
-            table=__DOMAIN_TABLE, data={"workspace_id": workspace_id, "name": domain["name"]}
-        )
-    log.info(f"Workspace {workspace_id}: synced {len(domains)} domain(s)")
+        op.upsert(table=__DOMAIN_TABLE, data={"workspace_id": workspace_id, "name": domain_name})
+
+    domain_state = state.setdefault(__STATE_DOMAIN_NAMES, {})
+    removed_names = set(domain_state.get(str(workspace_id)) or []) - domain_names
+    for domain_name in sorted(removed_names):
+        # The 'delete' operation is used to delete data from the destination table.
+        # The first argument is the name of the destination table.
+        # The second argument is a dictionary containing the primary key of the record to be deleted.
+        op.delete(table=__DOMAIN_TABLE, keys={"workspace_id": workspace_id, "name": domain_name})
+    domain_state[str(workspace_id)] = sorted(domain_names)
+    log.info(
+        f"Workspace {workspace_id}: synced {len(domain_names)} domain(s), "
+        f"deleted {len(removed_names)} removed domain(s)"
+    )
 
     # Save the progress by checkpointing the state. This is important for ensuring that the sync process can resume
     # from the correct position in case of next sync or interruptions.
@@ -610,9 +693,9 @@ def sync_conversions(session: requests.Session, base_url: str, state: dict):
     The conversions endpoint returns the most recent rows (at most __CONVERSION_LIMIT) with no
     pagination and no date filter. Ids are ULIDs, which sort chronologically, so the highest id
     delivered is the cursor and only rows with a greater id are new. Because ids are unique the
-    comparison is strict. If every returned row is newer than the cursor, more than
-    __CONVERSION_LIMIT conversions were recorded between syncs and the gap cannot be recovered
-    from this endpoint; a warning is logged so the sync frequency can be increased.
+    comparison is strict. If the endpoint returns its full __CONVERSION_LIMIT rows and every one
+    is newer than the cursor (or there is no cursor yet, on the initial sync), older conversions
+    may not have been returned and cannot be recovered from this endpoint, so a warning is logged.
     Args:
         session: The authenticated HTTP session.
         base_url: The API base URL.
@@ -632,11 +715,17 @@ def sync_conversions(session: requests.Session, base_url: str, state: dict):
 
     if new_conversions:
         state[__STATE_CONVERSION_CURSOR] = max(conversion["id"] for conversion in new_conversions)
-    if cursor and len(new_conversions) == len(conversions) == __CONVERSION_LIMIT:
-        log.warning(
-            f"All {__CONVERSION_LIMIT} returned conversions are newer than the cursor; conversions "
-            "recorded between syncs may have been missed. Sync more frequently."
-        )
+    if len(new_conversions) == len(conversions) == __CONVERSION_LIMIT:
+        if cursor:
+            log.warning(
+                f"All {__CONVERSION_LIMIT} returned conversions are newer than the cursor; "
+                "conversions recorded between syncs may have been missed. Sync more frequently."
+            )
+        else:
+            log.warning(
+                f"The initial sync received the maximum of {__CONVERSION_LIMIT} conversions; "
+                "older conversions may exist that the Linkly conversions endpoint cannot return."
+            )
     log.info(f"Synced {len(new_conversions)} new conversion(s) of {len(conversions)} returned")
 
     # Save the progress by checkpointing the state. This is important for ensuring that the sync process can resume

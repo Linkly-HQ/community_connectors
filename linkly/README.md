@@ -20,7 +20,7 @@ Refer to the [Connector SDK Setup Guide](https://fivetran.com/docs/connectors/co
 
 To initialize a new Connector SDK project using this connector as a starting point, run:
 
-```
+```bash
 fivetran init --template linkly
 ```
 
@@ -30,7 +30,7 @@ fivetran init --template linkly
 
 ## Features
 - Syncs every workspace the API key can access, or a configured subset of workspace IDs.
-- Full re-import of `link` and `domain` on every sync so counters and edits are always current (the Linkly API has no modification timestamp on links).
+- Full re-import of `link` and `domain` on every sync so counters and edits are always current (the Linkly API has no modification timestamp on links). Domains removed in Linkly are deleted from the destination.
 - Incremental daily click totals per workspace with a two-day replay window, so days that were still in progress are corrected on the next sync.
 - Incremental conversions using the ULID `id` as the cursor.
 - Retry with exponential backoff on HTTP 429 (rate limit), 5xx, timeouts and connection errors; immediate failure with a clear message on 401 and other 4xx responses.
@@ -84,7 +84,7 @@ The [Linkly API documentation](https://linklyhq.com/support/api) has screenshots
 - `link.rules`, `link.sparkline` and `conversion.metadata` are declared as `JSON` columns and passed to the SDK as Python objects; the SDK serialises them (pre-encoding with `json.dumps` would double-encode). `conversion.occurred_at` and `conversion.inserted_at` are `UTC_DATETIME`, and `click_daily.date` is a `NAIVE_DATE`. Refer to `schema()`.
 - Trashed links are fetched with `deleted=true` and upserted with `deleted = true` rather than removed, so their historical counters stay queryable. Links purged from the trash are not detected. Refer to `build_link_row()`.
 - `click_daily.clicks` includes bot traffic; `click_daily.human_clicks` is the same range requested with `bots=false`. Dates are UTC calendar days, so totals can differ from the Linkly dashboard when the workspace timezone is not UTC.
-- State layout: `{"link_resume_page": {"<workspace_id>:<active|deleted>": <page>}, "click_cursor_by_workspace": {"<workspace_id>": "YYYY-MM-DD"}, "conversion_cursor": "<ulid>"}`. `link_resume_page` entries exist only while a workspace's links are partially synced.
+- State layout: `{"link_resume_page": {"<workspace_id>:<active|deleted>": <page>}, "click_cursor_by_workspace": {"<workspace_id>": "YYYY-MM-DD"}, "conversion_cursor": "<ulid>", "domain_names_by_workspace": {"<workspace_id>": ["<domain name>"]}}`. `link_resume_page` entries exist only while a workspace's links are partially synced. `domain_names_by_workspace` holds the domain names delivered on the previous sync; names that no longer appear are removed with `op.delete()`. Refer to `sync_domains()`.
 - The `conversion` cursor comparison is strict (`id > cursor`) because ULIDs are unique and sort chronologically. Refer to `sync_conversions()`.
 - Column names follow Fivetran's naming rules in the destination, so for example `link.ga4_tag_id` arrives as `ga_4_tag_id`.
 
@@ -93,9 +93,9 @@ Refer to `get_json()`, `raise_permanent_error()` and `wait_before_retry()` in `c
 
 - 401 – Raises `RuntimeError` with a message pointing at the Linkly API key settings; not retried.
 - Other 4xx – Raises `RuntimeError` with the `error` or `message` field from the response body; not retried. Linkly returns 404 for workspaces the key cannot access, which cannot happen for workspaces returned by `GET /api/v1/workspaces`.
-- 429 – The response body's `current_usage`/`limit` is logged and the request is retried with exponential backoff (2, 4, 8, ... up to 120 seconds, 6 attempts). Linkly does not send a `Retry-After` header; if one is present it is honoured instead.
+- 429 – The response body's `current_usage`/`limit` is logged and the request is retried with exponential backoff (2, 4, 8, ... up to 120 seconds, 6 attempts). Linkly does not send a `Retry-After` header; if one is present, in either the seconds or the HTTP-date form, it is honoured instead, capped at 120 seconds.
 - 5xx, timeouts and connection errors – Retried with the same backoff; after 6 failed attempts a `RuntimeError` fails the sync.
-- Conversion overflow – If all 1,000 returned conversions are newer than the cursor, a warning is logged because conversions recorded between syncs may have been missed.
+- Conversion overflow – If the endpoint returns its full 1,000 rows and all of them are newer than the cursor, or the initial sync receives 1,000 rows, a warning is logged because older conversions may not have been returned.
 
 ## Tables created
 The connector creates five tables (refer to `schema()`):
@@ -111,7 +111,7 @@ The connector creates five tables (refer to `schema()`):
 Relationships: `link.workspace_id`, `domain.workspace_id` and `click_daily.workspace_id` reference `workspace.id`. `conversion.link_id` references `link.id` and is null when the conversion could not be attributed. `conversion.amount_cents` is an integer in minor units of `conversion.currency`.
 
 ## Additional files
-- `tests/mock_linkly_api.py` – A standard-library HTTP server that imitates the five Linkly endpoints with the response shapes from the OpenAPI spec, including one simulated HTTP 429 and bearer-token checking, so `fivetran debug` can run without a real API key. Start it with `python tests/mock_linkly_api.py 5055`.
+- `tests/mock_linkly_api.py` – A standard-library HTTP server that imitates the five Linkly endpoints with the response shapes from the OpenAPI spec, including one simulated HTTP 429 and bearer-token checking, so `fivetran debug` can run without a real API key. Start it with `python tests/mock_linkly_api.py 5055`. Restart it with `--drop-domain` and sync again to exercise domain deletion, or pass `--conversion-count <n>` to change how many conversions exist.
 - `tests/mock-configuration.json` – Configuration that points the connector at the mock server. Run `fivetran debug --configuration tests/mock-configuration.json` from the connector directory while the mock is running.
 
 ## Additional considerations

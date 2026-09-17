@@ -9,7 +9,14 @@ Run from the connector directory:
     python tests/mock_linkly_api.py 5055
 Then, in another terminal:
     fivetran debug --configuration tests/mock-configuration.json
+
+To exercise domain deletion, restart the mock with --drop-domain (workspace 43 then no longer
+returns ws43.example.com) and run fivetran debug again without resetting the state. Use
+--conversion-count to change how many conversions exist (the endpoint returns at most 1,000).
 """
+
+# For parsing the port and the scenario flags
+import argparse
 
 # For encoding JSON response bodies
 import json
@@ -32,8 +39,10 @@ WORKSPACES = [{"id": 42, "name": "Acme Marketing"}, {"id": 43, "name": "Acme Sal
 LINKS_PER_WORKSPACE = 230  # Forces three pages at page_size=100
 TRASHED_LINKS_PER_WORKSPACE = 3
 TRASHED_LINK_ID_OFFSET = 900
-CONVERSION_COUNT = 1200  # More than the endpoint's 1,000-row maximum
+DEFAULT_CONVERSION_COUNT = 1200  # More than the endpoint's 1,000-row maximum
+DROPPABLE_DOMAIN = {"workspace_id": 43, "name": "ws43.example.com"}  # Removed by --drop-domain
 RATE_LIMIT_ONCE = {"is_armed": True}
+SCENARIO = {"drop_domain": False}
 
 
 def make_link(workspace_id, number, is_deleted=False):
@@ -81,14 +90,16 @@ def make_link(workspace_id, number, is_deleted=False):
     }
 
 
-def make_conversions():
+def make_conversions(conversion_count):
     """
     Build the conversion list in the shape of the conversions response, most recent first.
+    Args:
+        conversion_count: How many conversions to generate.
     Returns:
         A list of conversion dictionaries with ULID-like ids that sort in creation order.
     """
     conversions = []
-    for index in range(CONVERSION_COUNT):
+    for index in range(conversion_count):
         conversions.append(
             {
                 "id": f"01K{index:023d}",
@@ -112,7 +123,7 @@ def make_conversions():
     return conversions
 
 
-CONVERSIONS = make_conversions()
+CONVERSIONS = make_conversions(DEFAULT_CONVERSION_COUNT)
 
 
 class MockLinklyHandler(BaseHTTPRequestHandler):
@@ -157,6 +168,10 @@ class MockLinklyHandler(BaseHTTPRequestHandler):
             return self.send_links(workspace_id, query)
         if resource == "domains":
             domains = [{"name": "go.example.com"}, {"name": f"ws{workspace_id}.example.com"}]
+            if SCENARIO["drop_domain"] and workspace_id == DROPPABLE_DOMAIN["workspace_id"]:
+                domains = [
+                    domain for domain in domains if domain != {"name": DROPPABLE_DOMAIN["name"]}
+                ]
             return self.send_json(200, {"domains": domains})
         if resource == "clicks":
             return self.send_clicks(workspace_id, query)
@@ -214,6 +229,21 @@ class MockLinklyHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
-    print(f"mock Linkly API on http://127.0.0.1:{port}/api/v1", flush=True)
-    HTTPServer(("127.0.0.1", port), MockLinklyHandler).serve_forever()
+    parser = argparse.ArgumentParser(description="Mock Linkly API for local connector testing")
+    parser.add_argument("port", nargs="?", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--drop-domain",
+        action="store_true",
+        help=f"Stop returning {DROPPABLE_DOMAIN['name']} to exercise domain deletion",
+    )
+    parser.add_argument(
+        "--conversion-count",
+        type=int,
+        default=DEFAULT_CONVERSION_COUNT,
+        help="Number of conversions that exist; 1000 or more fills the endpoint's cap",
+    )
+    arguments = parser.parse_args()
+    SCENARIO["drop_domain"] = arguments.drop_domain
+    CONVERSIONS[:] = make_conversions(arguments.conversion_count)
+    print(f"mock Linkly API on http://127.0.0.1:{arguments.port}/api/v1", flush=True)
+    HTTPServer(("127.0.0.1", arguments.port), MockLinklyHandler).serve_forever()
