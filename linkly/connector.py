@@ -704,18 +704,23 @@ def sync_conversions(session: requests.Session, base_url: str, state: dict):
     cursor = state.get(__STATE_CONVERSION_CURSOR)
     body = get_json(session, base_url, "conversions", {"limit": __CONVERSION_LIMIT})
     conversions = body.get("conversions") or []
-    new_conversions = [
-        conversion for conversion in conversions if not cursor or conversion["id"] > cursor
-    ]
-    for conversion in new_conversions:
+    new_count = 0
+    highest_id = cursor
+    # Rows are upserted as they are read; no second copy of the response is built in memory.
+    for conversion in conversions:
+        if cursor and conversion["id"] <= cursor:
+            continue
         # The 'upsert' operation is used to insert or update data in the destination table.
         # The first argument is the name of the destination table.
         # The second argument is a dictionary containing the record to be upserted.
         op.upsert(table=__CONVERSION_TABLE, data=build_conversion_row(conversion))
+        new_count += 1
+        if not highest_id or conversion["id"] > highest_id:
+            highest_id = conversion["id"]
 
-    if new_conversions:
-        state[__STATE_CONVERSION_CURSOR] = max(conversion["id"] for conversion in new_conversions)
-    if len(new_conversions) == len(conversions) == __CONVERSION_LIMIT:
+    if new_count:
+        state[__STATE_CONVERSION_CURSOR] = highest_id
+    if new_count == len(conversions) == __CONVERSION_LIMIT:
         if cursor:
             log.warning(
                 f"All {__CONVERSION_LIMIT} returned conversions are newer than the cursor; "
@@ -726,7 +731,7 @@ def sync_conversions(session: requests.Session, base_url: str, state: dict):
                 f"The initial sync received the maximum of {__CONVERSION_LIMIT} conversions; "
                 "older conversions may exist that the Linkly conversions endpoint cannot return."
             )
-    log.info(f"Synced {len(new_conversions)} new conversion(s) of {len(conversions)} returned")
+    log.info(f"Synced {new_count} new conversion(s) of {len(conversions)} returned")
 
     # Save the progress by checkpointing the state. This is important for ensuring that the sync process can resume
     # from the correct position in case of next sync or interruptions.

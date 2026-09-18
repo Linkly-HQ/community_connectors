@@ -35,7 +35,7 @@ fivetran init --template linkly
 - Incremental conversions using the ULID `id` as the cursor.
 - Retry with exponential backoff on HTTP 429 (rate limit), 5xx, timeouts and connection errors; immediate failure with a clear message on 401 and other 4xx responses.
 - Checkpoints after every page of links, every click window and every table, so an interrupted sync resumes rather than restarts.
-- Runs end to end without credentials against the bundled mock API for local testing.
+- Bounded memory use: rows are upserted as each page or date window arrives and nothing is accumulated across requests.
 
 ## Configuration file
 The connector reads the following keys from `configuration.json`, which is uploaded to Fivetran at deploy time. Remove the optional keys you do not need, or replace their placeholders with real values.
@@ -52,7 +52,7 @@ The connector reads the following keys from `configuration.json`, which is uploa
 - `api_key` (required) – A Linkly API key. One key can read every workspace its user is a member of. See [Authentication](#authentication).
 - `start_date` (optional) – `YYYY-MM-DD`. The first day of click history to sync into `click_daily`. Defaults to `2019-01-01`, the earliest date Linkly holds per-day click counts for. Must not be in the future.
 - `workspace_ids` (optional) – Comma-separated workspace IDs to restrict the sync, for example `42,43`. Defaults to all workspaces the key can access.
-- `base_url` (optional, testing only) – Overrides the API base URL `https://api.linklyhq.com/api/v1`. Used by `tests/mock-configuration.json` to point the connector at the local mock API.
+- `base_url` (optional, testing only) – Overrides the API base URL `https://api.linklyhq.com/api/v1`, for example to point the connector at a staging environment or a local stand-in that returns the response shapes documented in [Data handling](#data-handling).
 
 All values are validated in `validate_configuration()` before any request is made.
 
@@ -78,6 +78,7 @@ The [Linkly API documentation](https://linklyhq.com/support/api) has screenshots
 - `link` – `GET /api/v1/workspace/{id}/list_links` is page-number based (`page`, `page_size`; the response carries `page_number` and `total_pages`). The connector requests 100 links per page sorted by `id` ascending so the sequence is stable while new links are being created, exits on the last page or an empty page, and checkpoints the next page number in state under `link_resume_page` so an interrupted sync resumes at the same page. Active links and trashed links (`deleted=true`) are listed as two separate passes. Refer to `sync_links()` and `fetch_links_page()`.
 - `conversion` – `GET /api/v1/conversions` has no pagination; it returns at most the 1,000 most recent rows. Refer to `sync_conversions()`.
 - `workspace`, `domain`, `click_daily` – Single-response endpoints. Click history is requested in windows of up to 366 days per API call, with one call for all clicks and one with `bots=false` for human clicks. Refer to `sync_click_daily()` and `upsert_click_window()`.
+- Memory use – Each response is upserted and released before the next request is made, so the most the connector holds at once is one page of 100 links, one 366-day window of daily click totals (two small integer series), or the conversions response, which the API caps at 1,000 rows. Workspace and domain lists are a handful of short objects per account. High-volume accounts therefore increase the number of requests, not the memory footprint.
 
 ## Data handling
 - Only primary keys and the columns whose type must not be inferred are declared in `schema()`. All other columns are inferred from the API payload, so new fields that Linkly adds to a link or conversion flow through without a connector change.
@@ -87,6 +88,64 @@ The [Linkly API documentation](https://linklyhq.com/support/api) has screenshots
 - State layout: `{"link_resume_page": {"<workspace_id>:<active|deleted>": <page>}, "click_cursor_by_workspace": {"<workspace_id>": "YYYY-MM-DD"}, "conversion_cursor": "<ulid>", "domain_names_by_workspace": {"<workspace_id>": ["<domain name>"]}}`. `link_resume_page` entries exist only while a workspace's links are partially synced. `domain_names_by_workspace` holds the domain names delivered on the previous sync; names that no longer appear are removed with `op.delete()`. Refer to `sync_domains()`.
 - The `conversion` cursor comparison is strict (`id > cursor`) because ULIDs are unique and sort chronologically. Refer to `sync_conversions()`.
 - Column names follow Fivetran's naming rules in the destination, so for example `link.ga4_tag_id` arrives as `ga_4_tag_id`.
+
+- Expected API responses – The connector reads the following response shapes (fields abridged; every other field on a link or conversion is passed through as an inferred column):
+
+  `GET /api/v1/workspaces`
+
+  ```json
+  [{"id": 42, "name": "Acme Marketing"}]
+  ```
+
+  `GET /api/v1/workspace/{id}/list_links?page=1&page_size=100&sort_by=id&sort_dir=asc[&deleted=true]`
+
+  ```json
+  {
+    "links": [
+      {
+        "id": 42001, "workspace_id": 42, "name": "Summer sale", "url": "https://www.example.com/landing",
+        "full_url": "https://go.example.com/sale", "domain": "go.example.com", "slug": "/sale",
+        "enabled": true, "deleted": false, "utm_campaign": "summer_sale",
+        "rules": [{"what": "country", "matches": "US", "url": "https://us.example.com"}],
+        "sparkline": [1, 0, 4], "clicks_total": 1300, "human_clicks_total": 1100
+      }
+    ],
+    "page_number": 1, "page_size": 100, "total_pages": 3, "total_entries": 230
+  }
+  ```
+
+  `GET /api/v1/workspace/{id}/domains`
+
+  ```json
+  {"domains": [{"name": "go.example.com"}]}
+  ```
+
+  `GET /api/v1/workspace/{id}/clicks?start=2026-01-01&end=2026-12-31&frequency=day&timezone=UTC[&bots=false]`
+
+  ```json
+  {"traffic": [{"t": "2026-09-01", "y": 37}]}
+  ```
+
+  `GET /api/v1/conversions?limit=1000` (most recent first)
+
+  ```json
+  {
+    "conversions": [
+      {
+        "id": "01K5ZJ8Q7XH3M9T2V4B6N8P0RS", "link_id": 42001, "click_id": "01K5ZJ8Q2A...", "event_name": "purchase",
+        "event_type": "sale", "event_id": "shop-1001", "external_id": null, "amount_cents": 4999, "currency": "USD",
+        "country": "US", "ip_source": "browser", "source": "shopify", "metadata": {"sku": "SKU-1"},
+        "occurred_at": "2026-09-01T10:00:00Z", "inserted_at": "2026-09-01T10:00:05Z"
+      }
+    ]
+  }
+  ```
+
+  `HTTP 429`
+
+  ```json
+  {"error": "rate_limit_exceeded", "message": "Slow down", "current_usage": 101, "limit": 100}
+  ```
 
 ## Error handling
 Refer to `get_json()`, `raise_permanent_error()` and `wait_before_retry()` in `connector.py`.
@@ -109,11 +168,6 @@ The connector creates five tables (refer to `schema()`):
 | `conversion`  | `id`                    | incremental | `id`, `link_id` (LONG), `click_id`, `event_name`, `event_type`, `event_id`, `external_id`, `amount_cents` (LONG), `currency`, `country`, `ip_source`, `source`, `metadata` (JSON), `occurred_at` (UTC_DATETIME), `inserted_at` (UTC_DATETIME)                                                                                                                                                                                                                                                                                                       |
 
 Relationships: `link.workspace_id`, `domain.workspace_id` and `click_daily.workspace_id` reference `workspace.id`. `conversion.link_id` references `link.id` and is null when the conversion could not be attributed. `conversion.amount_cents` is an integer in minor units of `conversion.currency`.
-
-## Additional files
-The connector uses the following additional files:
-- **`tests/mock_linkly_api.py`** – A standard-library HTTP server that imitates the five Linkly endpoints with the response shapes from the OpenAPI spec, including one simulated HTTP 429 and bearer-token checking, so `fivetran debug` can run without a real API key. Start it with `python tests/mock_linkly_api.py 5055`. Restart it with `--drop-domain` and sync again to exercise domain deletion, or pass `--conversion-count <n>` to change how many conversions exist.
-- **`tests/mock-configuration.json`** – Configuration that points the connector at the mock server. Run `fivetran debug --configuration tests/mock-configuration.json` from the connector directory while the mock is running.
 
 ## Additional considerations
 The examples provided are intended to help you effectively use Fivetran's Connector SDK. While we've tested the code, Fivetran cannot be held responsible for any unexpected or negative consequences that may arise from using these examples. For inquiries, please reach out to our Support team.
